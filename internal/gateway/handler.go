@@ -169,6 +169,15 @@ func buildRule(rc config.Rule) rules.Rule {
 			maxReqs = 100
 		}
 		return rules.NewRateLimitRule(maxReqs, window)
+	case "time_window":
+		windows := make([]rules.TimeWindow, 0, len(rc.TimeWindows))
+		for _, tw := range rc.TimeWindows {
+			parsed, err := rules.ParseTimeWindow(tw.Days, tw.Start, tw.End)
+			if err == nil {
+				windows = append(windows, parsed)
+			}
+		}
+		return rules.NewTimeRule(windows, nil)
 	default:
 		return nil
 	}
