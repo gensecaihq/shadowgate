@@ -81,8 +81,12 @@ func (m *Metrics) RecordRequest(profileID, clientIP, action string, durationMs f
 	atomic.AddInt64(m.decisions[action], 1)
 	m.decisionMu.Unlock()
 
-	// Unique IPs
+	// Unique IPs (cap at 100k to prevent unbounded growth)
 	m.uniqueIPsMu.Lock()
+	if len(m.uniqueIPs) >= 100000 {
+		// Reset to prevent memory leak
+		m.uniqueIPs = make(map[string]struct{})
+	}
 	m.uniqueIPs[clientIP] = struct{}{}
 	m.uniqueIPsMu.Unlock()
 

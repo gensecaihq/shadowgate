@@ -37,18 +37,17 @@ A high-performance stealth redirector and deception gateway written in Go. Shado
 
 ### Deception & Proxying
 - **Reverse Proxy** - HTTP/HTTPS proxying to backend servers
-- **Load Balancing** - Round-robin and weighted backend selection
+- **Load Balancing** - Round-robin and weighted backend selection with health awareness
 - **Health Checks** - Automatic backend health monitoring and failover
 - **Static Decoys** - Serve configurable fake responses to blocked traffic
 - **Redirects** - Send 3xx redirects to external sites
 - **Tarpit** - Slow responses to waste attacker resources
-- **Honeypot Paths** - Detect and log access to sensitive paths
 
 ### Operations
 - **Structured Logging** - JSON logging with request metadata
 - **Metrics API** - Real-time statistics via REST endpoint
-- **Admin API** - Health, status, backends, and reload endpoints
-- **Hot Reload** - SIGHUP-based configuration reload without restart
+- **Admin API** - Health, status, backends, and config validation endpoints
+- **Config Validation** - SIGHUP-based configuration validation
 - **TLS Termination** - HTTPS listeners with configurable certificates
 
 ## Quick Start

@@ -204,14 +204,16 @@ curl http://127.0.0.1:9090/backends
 
 ### POST /reload
 
-Trigger configuration reload. The service re-reads the configuration file without restart.
+Validate configuration file. This endpoint validates the configuration without applying changes.
+
+**Note**: Currently validates configuration only. A service restart is required for changes to take effect. True hot reload may be added in a future version.
 
 **Response (Success)**
 
 ```json
 {
   "success": true,
-  "message": "Configuration reloaded successfully"
+  "message": "Configuration validated successfully"
 }
 ```
 
@@ -257,16 +259,16 @@ All endpoints return errors in a consistent format:
 
 ## Monitoring Integration
 
-### Prometheus
+### JSON Metrics
 
-The `/metrics` endpoint can be scraped by Prometheus. Example scrape config:
+The `/metrics` endpoint returns JSON format metrics. To integrate with monitoring systems:
 
-```yaml
-scrape_configs:
-  - job_name: 'shadowgate'
-    static_configs:
-      - targets: ['localhost:9090']
-    metrics_path: '/metrics'
+```bash
+# Fetch metrics as JSON
+curl -s http://127.0.0.1:9090/metrics | jq .
+
+# Example: Extract total requests with jq
+curl -s http://127.0.0.1:9090/metrics | jq '.total_requests'
 ```
 
 ### Health Check Scripts

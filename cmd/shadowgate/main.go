@@ -95,11 +95,33 @@ func main() {
 
 	// Handler factory creates gateway handlers for each profile
 	handlerFactory := func(p *profile.Profile) http.Handler {
+		// Create backend pool first (shared with admin API for health checking)
+		pool := proxy.NewPool()
+		for _, bc := range p.Config.Backends {
+			weight := bc.Weight
+			if weight == 0 {
+				weight = 1
+			}
+			backend, err := proxy.NewBackend(bc.Name, bc.URL, weight)
+			if err != nil {
+				logger.Error("Failed to create backend", map[string]interface{}{
+					"profile": p.ID,
+					"backend": bc.Name,
+					"error":   err.Error(),
+				})
+				continue
+			}
+			pool.Add(backend)
+		}
+		backendPools[p.ID] = pool
+
+		// Create handler with the shared pool
 		h, err := gateway.NewHandler(gateway.Config{
-			ProfileID: p.ID,
-			Profile:   p.Config,
-			Logger:    logger,
-			Metrics:   metricsCollector,
+			ProfileID:   p.ID,
+			Profile:     p.Config,
+			Logger:      logger,
+			Metrics:     metricsCollector,
+			BackendPool: pool,
 		})
 		if err != nil {
 			logger.Error("Failed to create handler", map[string]interface{}{
@@ -110,20 +132,6 @@ func main() {
 				w.WriteHeader(http.StatusInternalServerError)
 			})
 		}
-
-		// Track backend pool for this profile
-		pool := proxy.NewPool()
-		for _, bc := range p.Config.Backends {
-			weight := bc.Weight
-			if weight == 0 {
-				weight = 1
-			}
-			backend, _ := proxy.NewBackend(bc.Name, bc.URL, weight)
-			if backend != nil {
-				pool.Add(backend)
-			}
-		}
-		backendPools[p.ID] = pool
 
 		return h
 	}
@@ -136,15 +144,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Reload function for admin API
+	// Reload function for admin API (validates config, requires restart for changes)
 	reloadFunc := func() error {
 		newCfg, err := config.Load(*configPath)
 		if err != nil {
 			return err
 		}
-		cfg = newCfg
-		logger.Info("Configuration reloaded", map[string]interface{}{
-			"profiles": len(cfg.Profiles),
+		// Note: Currently only validates config. Actual changes require restart.
+		// TODO: Implement hot handler swapping for true hot reload.
+		logger.Info("Configuration validated", map[string]interface{}{
+			"profiles": len(newCfg.Profiles),
+			"note":     "restart required for changes to take effect",
 		})
 		return nil
 	}
@@ -214,18 +224,18 @@ func main() {
 		sig := <-sigChan
 		switch sig {
 		case syscall.SIGHUP:
-			logger.Info("Received SIGHUP, reloading configuration", nil)
-			fmt.Println("Received SIGHUP, reloading configuration...")
+			logger.Info("Received SIGHUP, validating configuration", nil)
+			fmt.Println("Received SIGHUP, validating configuration...")
 
 			if err := reloadFunc(); err != nil {
-				logger.Error("Configuration reload failed", map[string]interface{}{
+				logger.Error("Configuration validation failed", map[string]interface{}{
 					"error": err.Error(),
 				})
-				fmt.Fprintf(os.Stderr, "Reload failed: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Validation failed: %v\n", err)
 				continue
 			}
 
-			fmt.Printf("Configuration reloaded: %d profile(s)\n", len(cfg.Profiles))
+			fmt.Println("Configuration valid. Restart required for changes to take effect.")
 
 		case syscall.SIGINT, syscall.SIGTERM:
 			logger.Info("Shutting down", nil)

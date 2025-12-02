@@ -71,6 +71,12 @@ func (e *Engine) Evaluate(req *http.Request, clientIP string) Decision {
 		ClientIP: clientIP,
 	}
 
+	// Extract TLS information if available
+	if req.TLS != nil {
+		ctx.TLSVersion = req.TLS.Version
+		ctx.SNI = req.TLS.ServerName
+	}
+
 	// Check deny rules first (deny takes precedence)
 	if e.denyRules != nil {
 		result := e.evaluator.EvaluateGroup(e.denyRules, ctx)

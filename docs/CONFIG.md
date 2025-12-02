@@ -88,7 +88,6 @@ listeners:
 | `name` | string | Yes | Backend identifier |
 | `url` | string | Yes | Backend URL (e.g., `http://10.0.1.10:8080`) |
 | `weight` | int | No | Load balancing weight (default: 1) |
-| `timeout` | string | No | Request timeout (e.g., `30s`) |
 
 ```yaml
 backends:
@@ -386,20 +385,14 @@ decoy:
   body_file: /etc/shadowgate/decoy/index.html
 ```
 
-## Traffic Shaping
+## Traffic Shaping (Planned)
 
-Add delays to responses (useful for tarpitting).
+> **Note**: Traffic shaping configuration is parsed but not yet implemented. Use tarpit decoy mode for delayed responses.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `delay_min` | duration | Minimum delay |
-| `delay_max` | duration | Maximum delay (random between min/max) |
-
-```yaml
-shaping:
-  delay_min: 1s
-  delay_max: 5s
-```
+| `delay_min` | duration | Minimum delay (planned) |
+| `delay_max` | duration | Maximum delay (planned) |
 
 ## Complete Example
 

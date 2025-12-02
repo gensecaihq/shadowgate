@@ -106,20 +106,22 @@ Always validate before applying:
 /opt/shadowgate/shadowgate -validate -config /etc/shadowgate/config.yaml
 ```
 
-### Hot Reload
+### Configuration Validation
 
-Reload configuration without restart:
+Validate configuration without restart (changes require restart to take effect):
 
 ```bash
-# Via systemd
-sudo systemctl reload shadowgate
-
-# Via SIGHUP
+# Via SIGHUP (validates config, logs result)
 sudo kill -HUP $(pidof shadowgate)
 
-# Via Admin API
+# Via Admin API (validates config, returns result)
 curl -X POST http://127.0.0.1:9090/reload
+
+# Apply changes (requires restart)
+sudo systemctl restart shadowgate
 ```
+
+> **Note**: SIGHUP and the `/reload` endpoint validate the configuration but do not apply changes. A full service restart is required for configuration changes to take effect.
 
 ### Configuration Backup
 
@@ -144,8 +146,8 @@ sudo cp new_key.key /etc/shadowgate/server.key
 sudo chown shadowgate:shadowgate /etc/shadowgate/server.*
 sudo chmod 600 /etc/shadowgate/server.key
 
-# Reload configuration
-sudo systemctl reload shadowgate
+# Restart to load new certificates
+sudo systemctl restart shadowgate
 ```
 
 ---
@@ -346,11 +348,11 @@ Create `/etc/logrotate.d/shadowgate`:
     missingok
     notifempty
     create 0640 shadowgate shadowgate
-    postrotate
-        systemctl reload shadowgate > /dev/null 2>&1 || true
-    endscript
+    copytruncate
 }
 ```
+
+> **Note**: Using `copytruncate` avoids needing to restart the service. Alternatively, configure logging to stdout and use journald.
 
 ### GeoIP Database Updates
 
@@ -372,8 +374,8 @@ curl -o GeoLite2-Country.mmdb.gz \
 gunzip -c GeoLite2-Country.mmdb.gz > GeoLite2-Country.mmdb.new
 mv GeoLite2-Country.mmdb.new GeoLite2-Country.mmdb
 
-# Reload shadowgate
-curl -X POST http://127.0.0.1:9090/reload
+# Restart shadowgate to load new database
+sudo systemctl restart shadowgate
 ```
 
 ### Backup Procedures

@@ -6,6 +6,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -102,9 +103,8 @@ func (p *Pool) Next() *Backend {
 	if len(p.backends) == 0 {
 		return nil
 	}
-	idx := int(p.currentIdx % uint64(len(p.backends)))
-	p.currentIdx++
-	return p.backends[idx]
+	idx := atomic.AddUint64(&p.currentIdx, 1) - 1
+	return p.backends[idx%uint64(len(p.backends))]
 }
 
 // Get returns a backend by name

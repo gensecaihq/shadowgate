@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -27,10 +28,11 @@ type Handler struct {
 
 // Config configures the gateway handler
 type Config struct {
-	ProfileID string
-	Profile   config.ProfileConfig
-	Logger    *logging.Logger
-	Metrics   *metrics.Metrics
+	ProfileID   string
+	Profile     config.ProfileConfig
+	Logger      *logging.Logger
+	Metrics     *metrics.Metrics
+	BackendPool *proxy.Pool // Optional: if nil, will be created from Profile.Backends
 }
 
 // NewHandler creates a new gateway handler
@@ -52,18 +54,22 @@ func NewHandler(cfg Config) (*Handler, error) {
 
 	h.decisionEngine = decision.NewEngine(allowRules, denyRules)
 
-	// Build backend pool
-	h.backendPool = proxy.NewPool()
-	for _, bc := range cfg.Profile.Backends {
-		weight := bc.Weight
-		if weight == 0 {
-			weight = 1
+	// Use provided backend pool or create one
+	if cfg.BackendPool != nil {
+		h.backendPool = cfg.BackendPool
+	} else {
+		h.backendPool = proxy.NewPool()
+		for _, bc := range cfg.Profile.Backends {
+			weight := bc.Weight
+			if weight == 0 {
+				weight = 1
+			}
+			backend, err := proxy.NewBackend(bc.Name, bc.URL, weight)
+			if err != nil {
+				return nil, err
+			}
+			h.backendPool.Add(backend)
 		}
-		backend, err := proxy.NewBackend(bc.Name, bc.URL, weight)
-		if err != nil {
-			return nil, err
-		}
-		h.backendPool.Add(backend)
 	}
 
 	// Build decoy strategy
@@ -107,58 +113,44 @@ func buildRuleGroup(cfg *config.RuleGroup) *rules.Group {
 }
 
 func buildRule(rc config.Rule) rules.Rule {
+	var r rules.Rule
+	var err error
+
 	switch rc.Type {
 	case "ip_allow":
-		r, _ := rules.NewIPRule(rc.CIDRs, "allow")
-		return r
+		r, err = rules.NewIPRule(rc.CIDRs, "allow")
 	case "ip_deny":
-		r, _ := rules.NewIPRule(rc.CIDRs, "deny")
-		return r
+		r, err = rules.NewIPRule(rc.CIDRs, "deny")
 	case "ua_whitelist", "ua_match":
-		r, _ := rules.NewUARule(rc.Patterns, "whitelist")
-		return r
+		r, err = rules.NewUARule(rc.Patterns, "whitelist")
 	case "ua_blacklist":
-		r, _ := rules.NewUARule(rc.Patterns, "blacklist")
-		return r
+		r, err = rules.NewUARule(rc.Patterns, "blacklist")
 	case "geo_allow":
-		r, _ := rules.NewGeoRule(rc.Countries, "allow")
-		return r
+		r, err = rules.NewGeoRule(rc.Countries, "allow")
 	case "geo_deny":
-		r, _ := rules.NewGeoRule(rc.Countries, "deny")
-		return r
+		r, err = rules.NewGeoRule(rc.Countries, "deny")
 	case "asn_allow":
-		r, _ := rules.NewASNRule(rc.ASNs, "allow")
-		return r
+		r, err = rules.NewASNRule(rc.ASNs, "allow")
 	case "asn_deny":
-		r, _ := rules.NewASNRule(rc.ASNs, "deny")
-		return r
+		r, err = rules.NewASNRule(rc.ASNs, "deny")
 	case "method_allow":
-		r, _ := rules.NewMethodRule(rc.Methods, "allow")
-		return r
+		r, err = rules.NewMethodRule(rc.Methods, "allow")
 	case "method_deny":
-		r, _ := rules.NewMethodRule(rc.Methods, "deny")
-		return r
+		r, err = rules.NewMethodRule(rc.Methods, "deny")
 	case "path_allow":
-		r, _ := rules.NewPathRule(rc.Paths, "allow")
-		return r
+		r, err = rules.NewPathRule(rc.Paths, "allow")
 	case "path_deny":
-		r, _ := rules.NewPathRule(rc.Paths, "deny")
-		return r
+		r, err = rules.NewPathRule(rc.Paths, "deny")
 	case "header_allow":
-		r, _ := rules.NewHeaderRule(rc.HeaderName, rc.Patterns, rc.RequireHeader, "allow")
-		return r
+		r, err = rules.NewHeaderRule(rc.HeaderName, rc.Patterns, rc.RequireHeader, "allow")
 	case "header_deny":
-		r, _ := rules.NewHeaderRule(rc.HeaderName, rc.Patterns, rc.RequireHeader, "deny")
-		return r
+		r, err = rules.NewHeaderRule(rc.HeaderName, rc.Patterns, rc.RequireHeader, "deny")
 	case "tls_version":
-		r, _ := rules.NewTLSVersionRule(rc.TLSMinVersion, rc.TLSMaxVersion)
-		return r
+		r, err = rules.NewTLSVersionRule(rc.TLSMinVersion, rc.TLSMaxVersion)
 	case "sni_allow":
-		r, _ := rules.NewSNIRule(rc.SNIPatterns, rc.RequireSNI, "allow")
-		return r
+		r, err = rules.NewSNIRule(rc.SNIPatterns, rc.RequireSNI, "allow")
 	case "sni_deny":
-		r, _ := rules.NewSNIRule(rc.SNIPatterns, rc.RequireSNI, "deny")
-		return r
+		r, err = rules.NewSNIRule(rc.SNIPatterns, rc.RequireSNI, "deny")
 	case "rate_limit":
 		window, _ := time.ParseDuration(rc.Window)
 		if window == 0 {
@@ -172,15 +164,24 @@ func buildRule(rc config.Rule) rules.Rule {
 	case "time_window":
 		windows := make([]rules.TimeWindow, 0, len(rc.TimeWindows))
 		for _, tw := range rc.TimeWindows {
-			parsed, err := rules.ParseTimeWindow(tw.Days, tw.Start, tw.End)
-			if err == nil {
-				windows = append(windows, parsed)
+			parsed, parseErr := rules.ParseTimeWindow(tw.Days, tw.Start, tw.End)
+			if parseErr != nil {
+				log.Printf("Warning: failed to parse time window: %v", parseErr)
+				continue
 			}
+			windows = append(windows, parsed)
 		}
 		return rules.NewTimeRule(windows, nil)
 	default:
+		log.Printf("Warning: unknown rule type: %s", rc.Type)
 		return nil
 	}
+
+	if err != nil {
+		log.Printf("Warning: failed to build rule type %s: %v", rc.Type, err)
+		return nil
+	}
+	return r
 }
 
 func buildDecoyStrategy(cfg config.DecoyConfig) decoy.Strategy {
@@ -222,7 +223,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var statusCode int
 	switch d.Action {
 	case decision.AllowForward:
-		backend := h.backendPool.Next()
+		backend := h.backendPool.NextHealthy()
 		if backend != nil {
 			backend.ServeHTTP(w, r)
 			statusCode = http.StatusOK // approximate
