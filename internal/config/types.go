@@ -10,9 +10,19 @@ type Config struct {
 
 // GlobalConfig contains global settings
 type GlobalConfig struct {
-	Log         LogConfig `yaml:"log"`
-	GeoIPDBPath string    `yaml:"geoip_db_path"` // Path to MaxMind GeoIP database
-	MetricsAddr string    `yaml:"metrics_addr"`  // Address for metrics endpoint (e.g., ":9090")
+	Log              LogConfig   `yaml:"log"`
+	GeoIPDBPath      string      `yaml:"geoip_db_path"`       // Path to MaxMind GeoIP database
+	MetricsAddr      string      `yaml:"metrics_addr"`        // Address for metrics endpoint (e.g., ":9090")
+	AdminAPI         AdminConfig `yaml:"admin_api"`           // Admin API configuration
+	TrustedProxies   []string    `yaml:"trusted_proxies"`     // CIDRs of trusted proxies for X-Forwarded-For
+	MaxRequestBody   int64       `yaml:"max_request_body"`    // Maximum request body size in bytes (default: 10MB)
+	ShutdownTimeout  int         `yaml:"shutdown_timeout"`    // Graceful shutdown timeout in seconds (default: 30)
+}
+
+// AdminConfig configures the admin API security
+type AdminConfig struct {
+	Token       string   `yaml:"token"`         // Bearer token for authentication (required for non-health endpoints)
+	AllowedIPs  []string `yaml:"allowed_ips"`   // CIDRs allowed to access admin API
 }
 
 // LogConfig configures logging behavior
@@ -47,10 +57,11 @@ type TLSConfig struct {
 
 // BackendConfig defines an upstream backend
 type BackendConfig struct {
-	Name    string `yaml:"name"`
-	URL     string `yaml:"url"`    // e.g., "https://127.0.0.1:8443"
-	Weight  int    `yaml:"weight"` // for load balancing
-	Timeout string `yaml:"timeout"`
+	Name            string `yaml:"name"`
+	URL             string `yaml:"url"`              // e.g., "https://127.0.0.1:8443"
+	Weight          int    `yaml:"weight"`           // for load balancing
+	Timeout         string `yaml:"timeout"`
+	HealthCheckPath string `yaml:"health_check_path"` // Health check endpoint (default: "/")
 }
 
 // RulesConfig contains allow and deny rule groups

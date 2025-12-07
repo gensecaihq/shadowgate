@@ -103,7 +103,12 @@ func (hc *HealthChecker) checkAll() {
 }
 
 func (hc *HealthChecker) check(b *Backend) bool {
-	url := b.URL.Scheme + "://" + b.URL.Host + hc.config.Path
+	// Use backend's health check path if set, otherwise fall back to global config
+	path := b.HealthCheckPath
+	if path == "" {
+		path = hc.config.Path
+	}
+	url := b.URL.Scheme + "://" + b.URL.Host + path
 
 	ctx, cancel := context.WithTimeout(context.Background(), hc.config.Timeout)
 	defer cancel()
@@ -257,4 +262,101 @@ func (p *Pool) NextWeighted() *Backend {
 
 	// Fallback (shouldn't reach here)
 	return p.backends[0]
+}
+
+// ServeHTTPWithRetry attempts to serve a request, retrying with different backends on failure
+// Returns the backend that successfully handled the request, or nil if all attempts failed
+func (p *Pool) ServeHTTPWithRetry(w http.ResponseWriter, r *http.Request, maxRetries int) *Backend {
+	p.mu.RLock()
+	backends := p.backends
+	p.mu.RUnlock()
+
+	if len(backends) == 0 {
+		return nil
+	}
+
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
+	if maxRetries > len(backends) {
+		maxRetries = len(backends)
+	}
+
+	tried := make(map[string]bool)
+	start := int(atomic.AddUint64(&p.currentIdx, 1)) - 1
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Find a healthy backend we haven't tried yet
+		var backend *Backend
+		for i := 0; i < len(backends); i++ {
+			idx := (start + attempt + i) % len(backends)
+			b := backends[idx]
+			if !tried[b.Name] && b.IsHealthy() && b.circuitBreaker.Allow() {
+				backend = b
+				break
+			}
+		}
+
+		// If no healthy untried backend, try any untried backend
+		if backend == nil {
+			for i := 0; i < len(backends); i++ {
+				idx := (start + attempt + i) % len(backends)
+				b := backends[idx]
+				if !tried[b.Name] {
+					backend = b
+					break
+				}
+			}
+		}
+
+		if backend == nil {
+			break // All backends tried
+		}
+
+		tried[backend.Name] = true
+
+		// Create a response recorder to check if the backend succeeded
+		recorder := &retryResponseRecorder{
+			ResponseWriter: w,
+			statusCode:     0,
+			headerWritten:  false,
+		}
+
+		backend.ServeHTTP(recorder, r)
+
+		// Check if the request succeeded
+		if recorder.statusCode > 0 && recorder.statusCode < 500 && recorder.statusCode != http.StatusBadGateway && recorder.statusCode != http.StatusServiceUnavailable {
+			return backend
+		}
+
+		// If this is the last attempt or headers were already written, return
+		if attempt == maxRetries-1 || recorder.headerWritten {
+			return backend
+		}
+	}
+
+	return nil
+}
+
+// retryResponseRecorder wraps ResponseWriter to track if we can still retry
+type retryResponseRecorder struct {
+	http.ResponseWriter
+	statusCode    int
+	headerWritten bool
+}
+
+func (r *retryResponseRecorder) WriteHeader(code int) {
+	if !r.headerWritten {
+		r.statusCode = code
+		r.headerWritten = true
+		r.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (r *retryResponseRecorder) Write(b []byte) (int, error) {
+	if !r.headerWritten {
+		r.headerWritten = true
+		r.statusCode = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
 }

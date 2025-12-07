@@ -154,3 +154,36 @@ func TestValidateRegexPatterns(t *testing.T) {
 		t.Error("expected error for invalid regex")
 	}
 }
+
+func TestBackendURLValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"valid http", "http://127.0.0.1:9000", false},
+		{"valid https", "https://backend.example.com", false},
+		{"valid with path", "http://127.0.0.1:9000/api", false},
+		{"missing scheme", "127.0.0.1:9000", true},
+		{"invalid scheme", "ftp://127.0.0.1:9000", true},
+		{"missing host", "http://", true},
+		{"empty url", "", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := BackendConfig{
+				Name:   "test",
+				URL:    tc.url,
+				Weight: 1,
+			}
+			err := b.Validate()
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for URL %q", tc.url)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error for URL %q: %v", tc.url, err)
+			}
+		})
+	}
+}

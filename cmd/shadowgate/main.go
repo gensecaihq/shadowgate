@@ -102,7 +102,27 @@ func main() {
 			if weight == 0 {
 				weight = 1
 			}
-			backend, err := proxy.NewBackend(bc.Name, bc.URL, weight)
+
+			// Configure backend options
+			opts := proxy.DefaultBackendOptions()
+			if bc.HealthCheckPath != "" {
+				opts.HealthCheckPath = bc.HealthCheckPath
+			}
+			if bc.Timeout != "" {
+				timeout, err := time.ParseDuration(bc.Timeout)
+				if err != nil {
+					logger.Warn("Invalid backend timeout, using default", map[string]interface{}{
+						"profile": p.ID,
+						"backend": bc.Name,
+						"timeout": bc.Timeout,
+						"error":   err.Error(),
+					})
+				} else {
+					opts.Timeout = timeout
+				}
+			}
+
+			backend, err := proxy.NewBackendWithOptions(bc.Name, bc.URL, weight, opts)
 			if err != nil {
 				logger.Error("Failed to create backend", map[string]interface{}{
 					"profile": p.ID,
@@ -117,11 +137,13 @@ func main() {
 
 		// Create handler with the shared pool
 		h, err := gateway.NewHandler(gateway.Config{
-			ProfileID:   p.ID,
-			Profile:     p.Config,
-			Logger:      logger,
-			Metrics:     metricsCollector,
-			BackendPool: pool,
+			ProfileID:      p.ID,
+			Profile:        p.Config,
+			Logger:         logger,
+			Metrics:        metricsCollector,
+			BackendPool:    pool,
+			TrustedProxies: cfg.Global.TrustedProxies,
+			MaxRequestBody: cfg.Global.MaxRequestBody,
 		})
 		if err != nil {
 			logger.Error("Failed to create handler", map[string]interface{}{
@@ -167,6 +189,8 @@ func main() {
 			Metrics:    metricsCollector,
 			ReloadFunc: reloadFunc,
 			Version:    version,
+			AuthToken:  cfg.Global.AdminAPI.Token,
+			AllowedIPs: cfg.Global.AdminAPI.AllowedIPs,
 		})
 
 		// Register backend pools
@@ -238,31 +262,49 @@ func main() {
 			fmt.Println("Configuration valid. Restart required for changes to take effect.")
 
 		case syscall.SIGINT, syscall.SIGTERM:
-			logger.Info("Shutting down", nil)
-			fmt.Println("Shutting down...")
+			logger.Info("Shutting down - draining connections", nil)
+			fmt.Println("Shutting down - draining connections...")
 
-			// Stop health checkers
+			// Determine shutdown timeout
+			shutdownTimeout := 30 * time.Second
+			if cfg.Global.ShutdownTimeout > 0 {
+				shutdownTimeout = time.Duration(cfg.Global.ShutdownTimeout) * time.Second
+			}
+
+			// Stop health checkers first (stop marking backends unhealthy)
 			for _, checker := range healthCheckers {
 				checker.Stop()
 			}
+			logger.Info("Health checkers stopped", nil)
 
-			// Stop admin API
+			// Stop admin API with shorter timeout
 			if adminAPI != nil {
-				shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				adminAPI.Stop(shutdownCtx)
-				cancel()
+				adminCtx, adminCancel := context.WithTimeout(ctx, 5*time.Second)
+				adminAPI.Stop(adminCtx)
+				adminCancel()
+				logger.Info("Admin API stopped", nil)
 			}
 
-			// Stop all profiles
-			shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			// Stop all profiles with configurable drain timeout
+			logger.Info("Draining connections", map[string]interface{}{
+				"timeout_seconds": int(shutdownTimeout.Seconds()),
+			})
+			fmt.Printf("Waiting up to %v for connections to drain...\n", shutdownTimeout)
+
+			shutdownCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
 			if err := profileMgr.Stop(shutdownCtx); err != nil {
-				logger.Error("Error during shutdown", map[string]interface{}{
+				logger.Error("Error during connection drain", map[string]interface{}{
 					"error": err.Error(),
 				})
+				fmt.Fprintf(os.Stderr, "Warning: some connections may not have drained cleanly: %v\n", err)
+			} else {
+				logger.Info("All connections drained successfully", nil)
+				fmt.Println("All connections drained successfully")
 			}
 			cancel()
 
 			logger.Info("Shutdown complete", nil)
+			fmt.Println("Shutdown complete")
 			os.Exit(0)
 		}
 	}

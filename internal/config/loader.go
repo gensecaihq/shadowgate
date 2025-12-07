@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -60,7 +61,23 @@ func (c *Config) Validate() error {
 
 // Validate checks global configuration
 func (g *GlobalConfig) Validate() error {
-	return g.Log.Validate()
+	if err := g.Log.Validate(); err != nil {
+		return err
+	}
+
+	// Validate trusted proxies CIDRs
+	for _, cidr := range g.TrustedProxies {
+		_, _, err := net.ParseCIDR(cidr)
+		if err != nil {
+			// Try as single IP
+			ip := net.ParseIP(cidr)
+			if ip == nil {
+				return fmt.Errorf("invalid trusted proxy CIDR or IP: %s", cidr)
+			}
+		}
+	}
+
+	return nil
 }
 
 // Validate checks log configuration
@@ -144,6 +161,22 @@ func (b *BackendConfig) Validate() error {
 
 	if b.URL == "" {
 		return fmt.Errorf("backend URL is required")
+	}
+
+	// Validate URL format
+	u, err := url.Parse(b.URL)
+	if err != nil {
+		return fmt.Errorf("invalid backend URL %q: %w", b.URL, err)
+	}
+
+	// Ensure scheme is valid
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("backend URL must use http or https scheme: %s", b.URL)
+	}
+
+	// Ensure host is present
+	if u.Host == "" {
+		return fmt.Errorf("backend URL must include host: %s", b.URL)
 	}
 
 	if b.Weight < 0 {

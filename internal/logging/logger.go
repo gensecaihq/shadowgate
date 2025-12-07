@@ -144,6 +144,7 @@ func (l *Logger) Error(msg string, fields map[string]interface{}) {
 // RequestLog represents a request log entry
 type RequestLog struct {
 	Timestamp  time.Time `json:"timestamp"`
+	RequestID  string    `json:"request_id"`
 	ProfileID  string    `json:"profile_id"`
 	ClientIP   string    `json:"client_ip"`
 	Method     string    `json:"method"`

@@ -202,3 +202,139 @@ func TestPoolNextWeighted(t *testing.T) {
 		}
 	}
 }
+
+func TestServeHTTPWithRetry(t *testing.T) {
+	// Create backend servers - first one fails, second succeeds
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("success from backend2"))
+	}))
+	defer backend2.Close()
+
+	pool := NewPool()
+	b1, _ := NewBackend("failing", backend1.URL, 10)
+	b2, _ := NewBackend("working", backend2.URL, 10)
+	pool.Add(b1)
+	pool.Add(b2)
+
+	// Mark first backend as unhealthy so it's skipped
+	b1.SetHealthy(false)
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	rr := httptest.NewRecorder()
+
+	// With retry, should skip failing backend and succeed with second
+	result := pool.ServeHTTPWithRetry(rr, req, 2)
+
+	if result == nil {
+		t.Error("expected a backend to handle request")
+	}
+
+	// The working backend should have been used
+	if result.Name != "working" {
+		t.Errorf("expected 'working' backend, got %q", result.Name)
+	}
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rr.Code)
+	}
+}
+
+func TestServeHTTPWithRetryEmptyPool(t *testing.T) {
+	pool := NewPool()
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	rr := httptest.NewRecorder()
+
+	result := pool.ServeHTTPWithRetry(rr, req, 2)
+
+	if result != nil {
+		t.Error("expected nil from empty pool")
+	}
+}
+
+func TestServeHTTPWithRetrySingleBackend(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	pool := NewPool()
+	b, _ := NewBackend("single", backend.URL, 10)
+	pool.Add(b)
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	rr := httptest.NewRecorder()
+
+	result := pool.ServeHTTPWithRetry(rr, req, 3)
+
+	if result == nil {
+		t.Error("expected a backend to handle request")
+	}
+
+	if result.Name != "single" {
+		t.Errorf("expected 'single' backend, got %q", result.Name)
+	}
+}
+
+func TestBackendHealthCheckPath(t *testing.T) {
+	// Server that only responds healthy on /custom/health
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/custom/health" {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	// Backend with custom health path
+	b, err := NewBackendWithHealthPath("custom", server.URL, 10, "/custom/health")
+	if err != nil {
+		t.Fatalf("failed to create backend: %v", err)
+	}
+
+	if b.HealthCheckPath != "/custom/health" {
+		t.Errorf("expected health path '/custom/health', got %q", b.HealthCheckPath)
+	}
+
+	pool := NewPool()
+	pool.Add(b)
+
+	config := HealthConfig{
+		Enabled:  true,
+		Interval: 50 * time.Millisecond,
+		Timeout:  1 * time.Second,
+		Path:     "/", // Default path, but backend should use its own
+	}
+
+	hc := NewHealthChecker(pool, config)
+	hc.Start()
+	defer hc.Stop()
+
+	// Wait for health check
+	time.Sleep(100 * time.Millisecond)
+
+	// Backend should be healthy because it uses its custom health path
+	if !b.IsHealthy() {
+		t.Error("expected backend to be healthy using custom health path")
+	}
+}
+
+func TestBackendDefaultHealthPath(t *testing.T) {
+	// Test that default health path is set
+	b, err := NewBackend("default", "http://127.0.0.1:8080", 10)
+	if err != nil {
+		t.Fatalf("failed to create backend: %v", err)
+	}
+
+	if b.HealthCheckPath != "/" {
+		t.Errorf("expected default health path '/', got %q", b.HealthCheckPath)
+	}
+}

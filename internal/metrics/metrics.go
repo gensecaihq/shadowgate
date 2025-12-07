@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -23,7 +24,7 @@ type Metrics struct {
 	profileMu       sync.RWMutex
 
 	// Decision counters
-	decisions map[string]*int64
+	decisions  map[string]*int64
 	decisionMu sync.RWMutex
 
 	// Rule hit counters
@@ -37,6 +38,19 @@ type Metrics struct {
 	// Response time tracking
 	totalResponseTime int64
 	responseCount     int64
+
+	// Per-backend metrics
+	backendStats   map[string]*BackendStats
+	backendStatsMu sync.RWMutex
+}
+
+// BackendStats tracks per-backend statistics
+type BackendStats struct {
+	Requests      int64
+	Errors        int64
+	TotalLatency  int64 // microseconds
+	MinLatency    int64 // microseconds
+	MaxLatency    int64 // microseconds
 }
 
 // New creates a new metrics instance
@@ -47,6 +61,7 @@ func New() *Metrics {
 		decisions:       make(map[string]*int64),
 		ruleHits:        make(map[string]*int64),
 		uniqueIPs:       make(map[string]struct{}),
+		backendStats:    make(map[string]*BackendStats),
 	}
 }
 
@@ -106,19 +121,61 @@ func (m *Metrics) RecordRuleHit(ruleType string) {
 	m.ruleHitsMu.Unlock()
 }
 
+// RecordBackendRequest records a backend request with latency
+func (m *Metrics) RecordBackendRequest(backendName string, latencyUs int64, isError bool) {
+	m.backendStatsMu.Lock()
+	stats := m.backendStats[backendName]
+	if stats == nil {
+		stats = &BackendStats{
+			MinLatency: latencyUs,
+			MaxLatency: latencyUs,
+		}
+		m.backendStats[backendName] = stats
+	}
+	m.backendStatsMu.Unlock()
+
+	atomic.AddInt64(&stats.Requests, 1)
+	atomic.AddInt64(&stats.TotalLatency, latencyUs)
+
+	if isError {
+		atomic.AddInt64(&stats.Errors, 1)
+	}
+
+	// Update min/max latency (these need locking for correctness)
+	m.backendStatsMu.Lock()
+	if latencyUs < stats.MinLatency || stats.MinLatency == 0 {
+		stats.MinLatency = latencyUs
+	}
+	if latencyUs > stats.MaxLatency {
+		stats.MaxLatency = latencyUs
+	}
+	m.backendStatsMu.Unlock()
+}
+
+// BackendStatsSnapshot represents per-backend statistics snapshot
+type BackendStatsSnapshot struct {
+	Requests     int64   `json:"requests"`
+	Errors       int64   `json:"errors"`
+	ErrorRate    float64 `json:"error_rate"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	MinLatencyMs float64 `json:"min_latency_ms"`
+	MaxLatencyMs float64 `json:"max_latency_ms"`
+}
+
 // Snapshot represents a point-in-time metrics snapshot
 type Snapshot struct {
-	Uptime           string             `json:"uptime"`
-	TotalRequests    int64              `json:"total_requests"`
-	AllowedRequests  int64              `json:"allowed_requests"`
-	DeniedRequests   int64              `json:"denied_requests"`
-	DroppedRequests  int64              `json:"dropped_requests"`
-	UniqueIPs        int                `json:"unique_ips"`
-	AvgResponseMs    float64            `json:"avg_response_ms"`
-	RequestsPerSec   float64            `json:"requests_per_sec"`
-	ProfileRequests  map[string]int64   `json:"profile_requests"`
-	Decisions        map[string]int64   `json:"decisions"`
-	RuleHits         map[string]int64   `json:"rule_hits"`
+	Uptime           string                          `json:"uptime"`
+	TotalRequests    int64                           `json:"total_requests"`
+	AllowedRequests  int64                           `json:"allowed_requests"`
+	DeniedRequests   int64                           `json:"denied_requests"`
+	DroppedRequests  int64                           `json:"dropped_requests"`
+	UniqueIPs        int                             `json:"unique_ips"`
+	AvgResponseMs    float64                         `json:"avg_response_ms"`
+	RequestsPerSec   float64                         `json:"requests_per_sec"`
+	ProfileRequests  map[string]int64                `json:"profile_requests"`
+	Decisions        map[string]int64                `json:"decisions"`
+	RuleHits         map[string]int64                `json:"rule_hits"`
+	BackendStats     map[string]BackendStatsSnapshot `json:"backend_stats"`
 }
 
 // GetSnapshot returns a snapshot of current metrics
@@ -167,6 +224,35 @@ func (m *Metrics) GetSnapshot() *Snapshot {
 	uniqueCount := len(m.uniqueIPs)
 	m.uniqueIPsMu.RUnlock()
 
+	// Copy backend stats
+	m.backendStatsMu.RLock()
+	backendStats := make(map[string]BackendStatsSnapshot)
+	for name, stats := range m.backendStats {
+		requests := atomic.LoadInt64(&stats.Requests)
+		errors := atomic.LoadInt64(&stats.Errors)
+		totalLatency := atomic.LoadInt64(&stats.TotalLatency)
+
+		var errorRate float64
+		if requests > 0 {
+			errorRate = float64(errors) / float64(requests) * 100
+		}
+
+		var avgLatency float64
+		if requests > 0 {
+			avgLatency = float64(totalLatency) / float64(requests) / 1000.0 // us to ms
+		}
+
+		backendStats[name] = BackendStatsSnapshot{
+			Requests:     requests,
+			Errors:       errors,
+			ErrorRate:    errorRate,
+			AvgLatencyMs: avgLatency,
+			MinLatencyMs: float64(stats.MinLatency) / 1000.0,
+			MaxLatencyMs: float64(stats.MaxLatency) / 1000.0,
+		}
+	}
+	m.backendStatsMu.RUnlock()
+
 	return &Snapshot{
 		Uptime:          uptime.Round(time.Second).String(),
 		TotalRequests:   total,
@@ -179,6 +265,7 @@ func (m *Metrics) GetSnapshot() *Snapshot {
 		ProfileRequests: profileReqs,
 		Decisions:       decisions,
 		RuleHits:        ruleHits,
+		BackendStats:    backendStats,
 	}
 }
 
@@ -188,6 +275,113 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		snapshot := m.GetSnapshot()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(snapshot)
+	}
+}
+
+// PrometheusHandler returns an HTTP handler for Prometheus-format metrics
+func (m *Metrics) PrometheusHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		snapshot := m.GetSnapshot()
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+		// Total requests
+		fmt.Fprintf(w, "# HELP shadowgate_requests_total Total number of requests processed\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_requests_total counter\n")
+		fmt.Fprintf(w, "shadowgate_requests_total %d\n\n", snapshot.TotalRequests)
+
+		// Allowed/Denied/Dropped requests
+		fmt.Fprintf(w, "# HELP shadowgate_requests_allowed_total Total number of allowed requests\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_requests_allowed_total counter\n")
+		fmt.Fprintf(w, "shadowgate_requests_allowed_total %d\n\n", snapshot.AllowedRequests)
+
+		fmt.Fprintf(w, "# HELP shadowgate_requests_denied_total Total number of denied requests\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_requests_denied_total counter\n")
+		fmt.Fprintf(w, "shadowgate_requests_denied_total %d\n\n", snapshot.DeniedRequests)
+
+		fmt.Fprintf(w, "# HELP shadowgate_requests_dropped_total Total number of dropped requests\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_requests_dropped_total counter\n")
+		fmt.Fprintf(w, "shadowgate_requests_dropped_total %d\n\n", snapshot.DroppedRequests)
+
+		// Unique IPs
+		fmt.Fprintf(w, "# HELP shadowgate_unique_ips Number of unique client IPs seen\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_unique_ips gauge\n")
+		fmt.Fprintf(w, "shadowgate_unique_ips %d\n\n", snapshot.UniqueIPs)
+
+		// Average response time
+		fmt.Fprintf(w, "# HELP shadowgate_response_time_ms_avg Average response time in milliseconds\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_response_time_ms_avg gauge\n")
+		fmt.Fprintf(w, "shadowgate_response_time_ms_avg %.3f\n\n", snapshot.AvgResponseMs)
+
+		// Requests per second
+		fmt.Fprintf(w, "# HELP shadowgate_requests_per_second Current request rate\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_requests_per_second gauge\n")
+		fmt.Fprintf(w, "shadowgate_requests_per_second %.3f\n\n", snapshot.RequestsPerSec)
+
+		// Per-profile requests
+		fmt.Fprintf(w, "# HELP shadowgate_profile_requests_total Requests per profile\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_profile_requests_total counter\n")
+		for profile, count := range snapshot.ProfileRequests {
+			fmt.Fprintf(w, "shadowgate_profile_requests_total{profile=%q} %d\n", profile, count)
+		}
+		fmt.Fprintf(w, "\n")
+
+		// Per-decision counts
+		fmt.Fprintf(w, "# HELP shadowgate_decisions_total Counts by decision type\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_decisions_total counter\n")
+		for decision, count := range snapshot.Decisions {
+			fmt.Fprintf(w, "shadowgate_decisions_total{decision=%q} %d\n", decision, count)
+		}
+		fmt.Fprintf(w, "\n")
+
+		// Per-rule hits
+		fmt.Fprintf(w, "# HELP shadowgate_rule_hits_total Counts by rule type\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_rule_hits_total counter\n")
+		for rule, count := range snapshot.RuleHits {
+			fmt.Fprintf(w, "shadowgate_rule_hits_total{rule=%q} %d\n", rule, count)
+		}
+		fmt.Fprintf(w, "\n")
+
+		// Backend metrics
+		fmt.Fprintf(w, "# HELP shadowgate_backend_requests_total Total requests per backend\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_backend_requests_total counter\n")
+		for backend, stats := range snapshot.BackendStats {
+			fmt.Fprintf(w, "shadowgate_backend_requests_total{backend=%q} %d\n", backend, stats.Requests)
+		}
+		fmt.Fprintf(w, "\n")
+
+		fmt.Fprintf(w, "# HELP shadowgate_backend_errors_total Total errors per backend\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_backend_errors_total counter\n")
+		for backend, stats := range snapshot.BackendStats {
+			fmt.Fprintf(w, "shadowgate_backend_errors_total{backend=%q} %d\n", backend, stats.Errors)
+		}
+		fmt.Fprintf(w, "\n")
+
+		fmt.Fprintf(w, "# HELP shadowgate_backend_latency_ms_avg Average latency per backend in milliseconds\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_backend_latency_ms_avg gauge\n")
+		for backend, stats := range snapshot.BackendStats {
+			fmt.Fprintf(w, "shadowgate_backend_latency_ms_avg{backend=%q} %.3f\n", backend, stats.AvgLatencyMs)
+		}
+		fmt.Fprintf(w, "\n")
+
+		fmt.Fprintf(w, "# HELP shadowgate_backend_latency_ms_min Minimum latency per backend in milliseconds\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_backend_latency_ms_min gauge\n")
+		for backend, stats := range snapshot.BackendStats {
+			fmt.Fprintf(w, "shadowgate_backend_latency_ms_min{backend=%q} %.3f\n", backend, stats.MinLatencyMs)
+		}
+		fmt.Fprintf(w, "\n")
+
+		fmt.Fprintf(w, "# HELP shadowgate_backend_latency_ms_max Maximum latency per backend in milliseconds\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_backend_latency_ms_max gauge\n")
+		for backend, stats := range snapshot.BackendStats {
+			fmt.Fprintf(w, "shadowgate_backend_latency_ms_max{backend=%q} %.3f\n", backend, stats.MaxLatencyMs)
+		}
+		fmt.Fprintf(w, "\n")
+
+		fmt.Fprintf(w, "# HELP shadowgate_backend_error_rate Error rate per backend (percentage)\n")
+		fmt.Fprintf(w, "# TYPE shadowgate_backend_error_rate gauge\n")
+		for backend, stats := range snapshot.BackendStats {
+			fmt.Fprintf(w, "shadowgate_backend_error_rate{backend=%q} %.2f\n", backend, stats.ErrorRate)
+		}
 	}
 }
 
@@ -215,6 +409,10 @@ func (m *Metrics) Reset() {
 	m.uniqueIPsMu.Lock()
 	m.uniqueIPs = make(map[string]struct{})
 	m.uniqueIPsMu.Unlock()
+
+	m.backendStatsMu.Lock()
+	m.backendStats = make(map[string]*BackendStats)
+	m.backendStatsMu.Unlock()
 
 	m.startTime = time.Now()
 }

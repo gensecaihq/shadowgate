@@ -1,6 +1,9 @@
 package gateway
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +19,16 @@ import (
 	"shadowgate/internal/rules"
 )
 
+// generateRequestID generates a unique request ID
+func generateRequestID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// DefaultMaxRequestBody is the default maximum request body size (10MB)
+const DefaultMaxRequestBody = 10 * 1024 * 1024
+
 // Handler is the main HTTP handler for the gateway
 type Handler struct {
 	profileID      string
@@ -24,23 +37,51 @@ type Handler struct {
 	decoyStrategy  decoy.Strategy
 	logger         *logging.Logger
 	metrics        *metrics.Metrics
+	trustedProxies []*net.IPNet
+	maxRequestBody int64
 }
 
 // Config configures the gateway handler
 type Config struct {
-	ProfileID   string
-	Profile     config.ProfileConfig
-	Logger      *logging.Logger
-	Metrics     *metrics.Metrics
-	BackendPool *proxy.Pool // Optional: if nil, will be created from Profile.Backends
+	ProfileID      string
+	Profile        config.ProfileConfig
+	Logger         *logging.Logger
+	Metrics        *metrics.Metrics
+	BackendPool    *proxy.Pool  // Optional: if nil, will be created from Profile.Backends
+	TrustedProxies []string     // CIDRs of trusted proxies for X-Forwarded-For
+	MaxRequestBody int64        // Maximum request body size in bytes (0 = default 10MB)
 }
 
 // NewHandler creates a new gateway handler
 func NewHandler(cfg Config) (*Handler, error) {
+	maxBody := cfg.MaxRequestBody
+	if maxBody <= 0 {
+		maxBody = DefaultMaxRequestBody
+	}
+
 	h := &Handler{
-		profileID: cfg.ProfileID,
-		logger:    cfg.Logger,
-		metrics:   cfg.Metrics,
+		profileID:      cfg.ProfileID,
+		logger:         cfg.Logger,
+		metrics:        cfg.Metrics,
+		maxRequestBody: maxBody,
+	}
+
+	// Parse trusted proxies
+	for _, cidr := range cfg.TrustedProxies {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			// Try as single IP
+			ip := net.ParseIP(cidr)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid trusted proxy: %s", cidr)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			network = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+		}
+		h.trustedProxies = append(h.trustedProxies, network)
 	}
 
 	// Build rule groups from config
@@ -213,8 +254,23 @@ func buildDecoyStrategy(cfg config.DecoyConfig) decoy.Strategy {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	// Generate or extract request ID for tracing
+	requestID := r.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = generateRequestID()
+	}
+	// Set request ID on response for client correlation
+	w.Header().Set("X-Request-ID", requestID)
+	// Add to request for backend forwarding
+	r.Header.Set("X-Request-ID", requestID)
+
+	// Limit request body size to prevent DoS attacks
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, h.maxRequestBody)
+	}
+
 	// Extract client IP
-	clientIP := extractClientIP(r)
+	clientIP := h.extractClientIP(r)
 
 	// Evaluate rules
 	d := h.decisionEngine.Evaluate(r, clientIP)
@@ -266,6 +322,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.logger != nil {
 		h.logger.LogRequest(logging.RequestLog{
 			Timestamp:  start,
+			RequestID:  requestID,
 			ProfileID:  h.profileID,
 			ClientIP:   clientIP,
 			Method:     r.Method,
@@ -280,24 +337,57 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func extractClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 {
-			return strings.TrimSpace(parts[0])
+// extractClientIP extracts the client IP from the request.
+// If trusted proxies are configured, X-Forwarded-For is only trusted when
+// the request comes from a trusted proxy.
+func (h *Handler) extractClientIP(r *http.Request) string {
+	// Get the direct connection IP
+	directIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		directIP = r.RemoteAddr
+	}
+
+	// If no trusted proxies configured, use legacy behavior (trust XFF)
+	// For backwards compatibility
+	if len(h.trustedProxies) == 0 {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			if len(parts) > 0 {
+				return strings.TrimSpace(parts[0])
+			}
+		}
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return xri
+		}
+		return directIP
+	}
+
+	// Check if the direct connection is from a trusted proxy
+	directParsed := net.ParseIP(directIP)
+	if directParsed == nil {
+		return directIP
+	}
+
+	isTrusted := false
+	for _, network := range h.trustedProxies {
+		if network.Contains(directParsed) {
+			isTrusted = true
+			break
 		}
 	}
 
-	// Check X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+	// Only trust X-Forwarded-For if request is from a trusted proxy
+	if isTrusted {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			if len(parts) > 0 {
+				return strings.TrimSpace(parts[0])
+			}
+		}
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return xri
+		}
 	}
 
-	// Fall back to RemoteAddr
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return directIP
 }

@@ -1,6 +1,6 @@
 module shadowgate
 
-go 1.25.0
+go 1.21
 
 require (
 	github.com/oschwald/geoip2-golang v1.13.0 // indirect

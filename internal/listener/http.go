@@ -6,16 +6,18 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
 // HTTPListener handles HTTP/HTTPS connections
 type HTTPListener struct {
-	addr       string
-	tlsConfig  *tls.Config
-	handler    http.Handler
-	server     *http.Server
-	listener   net.Listener
+	addr        string
+	tlsConfig   *tls.Config
+	handler     http.Handler
+	server      *http.Server
+	listener    net.Listener
+	activeConns int64 // atomic counter for active connections
 }
 
 // HTTPListenerConfig configures the HTTP listener
@@ -49,6 +51,7 @@ func (l *HTTPListener) Start(ctx context.Context) error {
 		IdleTimeout:       120 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1MB
+		ConnState:         l.trackConnState,
 	}
 
 	if l.tlsConfig != nil {
@@ -64,6 +67,21 @@ func (l *HTTPListener) Start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// trackConnState tracks connection state changes for monitoring
+func (l *HTTPListener) trackConnState(conn net.Conn, state http.ConnState) {
+	switch state {
+	case http.StateNew:
+		atomic.AddInt64(&l.activeConns, 1)
+	case http.StateClosed, http.StateHijacked:
+		atomic.AddInt64(&l.activeConns, -1)
+	}
+}
+
+// ActiveConnections returns the number of active connections
+func (l *HTTPListener) ActiveConnections() int64 {
+	return atomic.LoadInt64(&l.activeConns)
 }
 
 // Stop gracefully shuts down the HTTP listener

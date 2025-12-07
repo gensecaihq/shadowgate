@@ -12,6 +12,8 @@ type RateLimitRule struct {
 	window      time.Duration
 	counters    map[string]*rateLimitCounter
 	mu          sync.RWMutex
+	stopChan    chan struct{}
+	stopped     bool
 }
 
 type rateLimitCounter struct {
@@ -25,6 +27,7 @@ func NewRateLimitRule(maxRequests int, window time.Duration) *RateLimitRule {
 		maxRequests: maxRequests,
 		window:      window,
 		counters:    make(map[string]*rateLimitCounter),
+		stopChan:    make(chan struct{}),
 	}
 
 	// Start cleanup goroutine
@@ -33,20 +36,35 @@ func NewRateLimitRule(maxRequests int, window time.Duration) *RateLimitRule {
 	return r
 }
 
+// Stop stops the background cleanup goroutine
+func (r *RateLimitRule) Stop() {
+	r.mu.Lock()
+	if !r.stopped {
+		r.stopped = true
+		close(r.stopChan)
+	}
+	r.mu.Unlock()
+}
+
 // cleanup periodically removes expired entries
 func (r *RateLimitRule) cleanup() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		r.mu.Lock()
-		now := time.Now()
-		for ip, counter := range r.counters {
-			if now.After(counter.windowEnd) {
-				delete(r.counters, ip)
+	for {
+		select {
+		case <-r.stopChan:
+			return
+		case <-ticker.C:
+			r.mu.Lock()
+			now := time.Now()
+			for ip, counter := range r.counters {
+				if now.After(counter.windowEnd) {
+					delete(r.counters, ip)
+				}
 			}
+			r.mu.Unlock()
 		}
-		r.mu.Unlock()
 	}
 }
 

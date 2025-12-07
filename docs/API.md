@@ -142,6 +142,71 @@ curl http://127.0.0.1:9090/metrics
 
 ---
 
+### GET /metrics/prometheus
+
+Request metrics in Prometheus exposition format. This endpoint is compatible with Prometheus scrapers.
+
+**Response**
+
+```text
+# HELP shadowgate_requests_total Total number of requests processed
+# TYPE shadowgate_requests_total counter
+shadowgate_requests_total 150000
+
+# HELP shadowgate_requests_allowed_total Total number of allowed requests
+# TYPE shadowgate_requests_allowed_total counter
+shadowgate_requests_allowed_total 125000
+
+# HELP shadowgate_requests_denied_total Total number of denied requests
+# TYPE shadowgate_requests_denied_total counter
+shadowgate_requests_denied_total 25000
+
+# HELP shadowgate_unique_ips Number of unique client IPs seen
+# TYPE shadowgate_unique_ips gauge
+shadowgate_unique_ips 5000
+
+# HELP shadowgate_response_time_ms_avg Average response time in milliseconds
+# TYPE shadowgate_response_time_ms_avg gauge
+shadowgate_response_time_ms_avg 12.500
+
+# HELP shadowgate_requests_per_second Current request rate
+# TYPE shadowgate_requests_per_second gauge
+shadowgate_requests_per_second 15.200
+
+# HELP shadowgate_profile_requests_total Requests per profile
+# TYPE shadowgate_profile_requests_total counter
+shadowgate_profile_requests_total{profile="c2-front"} 100000
+shadowgate_profile_requests_total{profile="phishing"} 50000
+
+# HELP shadowgate_decisions_total Counts by decision type
+# TYPE shadowgate_decisions_total counter
+shadowgate_decisions_total{decision="allow_forward"} 125000
+shadowgate_decisions_total{decision="deny_decoy"} 24000
+
+# HELP shadowgate_rule_hits_total Counts by rule type
+# TYPE shadowgate_rule_hits_total counter
+shadowgate_rule_hits_total{rule="ip_allow"} 125000
+shadowgate_rule_hits_total{rule="ua_blacklist"} 15000
+```
+
+**Prometheus Configuration**
+
+```yaml
+scrape_configs:
+  - job_name: 'shadowgate'
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+    metrics_path: '/metrics/prometheus'
+```
+
+**Example**
+
+```bash
+curl http://127.0.0.1:9090/metrics/prometheus
+```
+
+---
+
 ### GET /backends
 
 Backend pool status and health information.

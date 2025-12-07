@@ -55,6 +55,72 @@ global:
   metrics_addr: "127.0.0.1:9090"
 ```
 
+### `global.trusted_proxies`
+
+CIDRs of trusted proxies for X-Forwarded-For header handling. When configured, the X-Forwarded-For and X-Real-IP headers are only trusted when the request originates from an IP within these ranges. This prevents IP spoofing attacks.
+
+If not configured, the legacy behavior is used (always trust X-Forwarded-For), which is suitable for deployments where ShadowGate is only accessible through trusted proxies.
+
+```yaml
+global:
+  trusted_proxies:
+    - "10.0.0.0/8"        # Internal load balancers
+    - "172.16.0.0/12"     # Docker networks
+    - "192.168.1.100"     # Specific proxy IP
+```
+
+**Security Note**: In production, always configure `trusted_proxies` to prevent X-Forwarded-For spoofing from untrusted sources.
+
+### `global.max_request_body`
+
+Maximum allowed request body size in bytes. Requests exceeding this limit will be rejected with a 413 error. Default is 10MB (10485760 bytes).
+
+```yaml
+global:
+  max_request_body: 5242880  # 5MB
+```
+
+This setting helps protect against denial-of-service attacks using large request bodies.
+
+### `global.shutdown_timeout`
+
+Graceful shutdown timeout in seconds. During shutdown, ShadowGate will wait up to this duration for active connections to drain before forcefully closing them. Default is 30 seconds.
+
+```yaml
+global:
+  shutdown_timeout: 60  # Wait up to 60 seconds for connections to drain
+```
+
+**Recommendations**:
+- Set this higher than your longest expected request duration
+- For long-polling or WebSocket applications, consider a longer timeout
+- The default of 30 seconds is suitable for most API workloads
+
+### `global.admin_api`
+
+Security configuration for the admin API. When enabled, all endpoints except `/health` require authentication.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `token` | string | (none) | Bearer token required for API access |
+| `allowed_ips` | []string | (none) | CIDRs allowed to access the admin API |
+
+```yaml
+global:
+  admin_api:
+    token: "your-secret-token-here"
+    allowed_ips:
+      - "127.0.0.1"         # Localhost only
+      - "10.0.0.0/8"        # Internal network
+```
+
+**Security Notes**:
+- The `/health` endpoint is always accessible without authentication (for load balancer health checks)
+- If `token` is set, all other endpoints require `Authorization: Bearer <token>` header
+- If `allowed_ips` is set, requests from IPs not in the list receive 403 Forbidden
+- Both can be combined: IP check happens first, then token validation
+- In production, always configure at least one of these options
+
 ## Profiles
 
 Each profile defines an independent traffic handling configuration.
@@ -88,16 +154,30 @@ listeners:
 | `name` | string | Yes | Backend identifier |
 | `url` | string | Yes | Backend URL (e.g., `http://10.0.1.10:8080`) |
 | `weight` | int | No | Load balancing weight (default: 1) |
+| `health_check_path` | string | No | Health check endpoint path (default: `/`) |
+| `timeout` | string | No | Request timeout duration (default: `30s`) |
 
 ```yaml
 backends:
   - name: primary
     url: http://10.0.1.10:8080
     weight: 10
+    health_check_path: /health
+    timeout: 30s
   - name: secondary
     url: http://10.0.1.11:8080
     weight: 5
+    health_check_path: /api/status
+    timeout: 60s  # longer timeout for slow API
 ```
+
+Each backend can have its own health check endpoint and timeout. This is useful when backends have different health check paths, response times, or when you need to check application-specific endpoints.
+
+**Timeout Configuration**:
+- The `timeout` field accepts Go duration strings (e.g., `30s`, `1m`, `500ms`)
+- This controls how long ShadowGate waits for the backend to respond
+- Use longer timeouts for slow backends or APIs with heavy processing
+- Use shorter timeouts for fast backends to fail quickly and try alternatives
 
 ## Rules Configuration
 
