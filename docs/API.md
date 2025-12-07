@@ -9,9 +9,55 @@ Enable the Admin API by setting `metrics_addr` in the global configuration:
 ```yaml
 global:
   metrics_addr: "127.0.0.1:9090"
+  admin_api:
+    token: "your-secret-token"      # Optional: Bearer token for authentication
+    allowed_ips:                     # Optional: IP allowlist
+      - "127.0.0.1"
+      - "10.0.0.0/8"
 ```
 
-**Security Note**: The Admin API should only be accessible from trusted networks. Use firewall rules to restrict access.
+## Authentication
+
+When authentication is configured, all endpoints **except `/health`** require authentication.
+
+### Bearer Token Authentication
+
+If `admin_api.token` is configured, requests must include the `Authorization` header:
+
+```bash
+curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:9090/status
+```
+
+**Response without token (401 Unauthorized)**:
+```
+Unauthorized
+```
+
+### IP Allowlist
+
+If `admin_api.allowed_ips` is configured, requests must originate from an allowed IP/CIDR:
+
+```bash
+# From allowed IP - succeeds
+curl http://127.0.0.1:9090/status
+
+# From disallowed IP - fails with 403
+curl http://192.168.1.100:9090/status
+```
+
+**Response from disallowed IP (403 Forbidden)**:
+```
+Forbidden
+```
+
+### Combined Authentication
+
+When both token and IP allowlist are configured:
+1. IP check is performed first
+2. If IP is allowed, token is validated
+3. Both must pass for access
+
+**Security Note**: Always configure at least one authentication method in production. The `/health` endpoint remains unauthenticated for load balancer health checks.
 
 ## Endpoints
 
@@ -96,6 +142,7 @@ Request metrics and statistics.
   "total_requests": 150000,
   "allowed_requests": 125000,
   "denied_requests": 25000,
+  "dropped_requests": 500,
   "unique_ips": 5000,
   "avg_response_ms": 12.5,
   "requests_per_sec": 15.2,
@@ -115,6 +162,24 @@ Request metrics and statistics.
     "ua_blacklist": 15000,
     "geo_deny": 5000,
     "rate_limit": 5000
+  },
+  "backend_stats": {
+    "backend1": {
+      "requests": 75000,
+      "errors": 150,
+      "error_rate": 0.2,
+      "avg_latency_ms": 8.5,
+      "min_latency_ms": 1.2,
+      "max_latency_ms": 245.8
+    },
+    "backend2": {
+      "requests": 50000,
+      "errors": 100,
+      "error_rate": 0.2,
+      "avg_latency_ms": 12.3,
+      "min_latency_ms": 2.1,
+      "max_latency_ms": 189.4
+    }
   }
 }
 ```
@@ -127,12 +192,25 @@ Request metrics and statistics.
 | `total_requests` | int64 | Total requests processed |
 | `allowed_requests` | int64 | Requests forwarded to backends |
 | `denied_requests` | int64 | Requests served decoys |
+| `dropped_requests` | int64 | Requests dropped |
 | `unique_ips` | int | Unique client IPs seen |
 | `avg_response_ms` | float64 | Average response time |
 | `requests_per_sec` | float64 | Current request rate |
 | `profile_requests` | map | Requests per profile |
 | `decisions` | map | Count by decision type |
 | `rule_hits` | map | Count by rule type |
+| `backend_stats` | map | Per-backend statistics |
+
+**Backend Stats Fields**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `requests` | int64 | Total requests to backend |
+| `errors` | int64 | Failed requests (5xx responses) |
+| `error_rate` | float64 | Error percentage |
+| `avg_latency_ms` | float64 | Average response latency |
+| `min_latency_ms` | float64 | Minimum observed latency |
+| `max_latency_ms` | float64 | Maximum observed latency |
 
 **Example**
 
@@ -161,6 +239,10 @@ shadowgate_requests_allowed_total 125000
 # TYPE shadowgate_requests_denied_total counter
 shadowgate_requests_denied_total 25000
 
+# HELP shadowgate_requests_dropped_total Total number of dropped requests
+# TYPE shadowgate_requests_dropped_total counter
+shadowgate_requests_dropped_total 500
+
 # HELP shadowgate_unique_ips Number of unique client IPs seen
 # TYPE shadowgate_unique_ips gauge
 shadowgate_unique_ips 5000
@@ -187,6 +269,56 @@ shadowgate_decisions_total{decision="deny_decoy"} 24000
 # TYPE shadowgate_rule_hits_total counter
 shadowgate_rule_hits_total{rule="ip_allow"} 125000
 shadowgate_rule_hits_total{rule="ua_blacklist"} 15000
+
+# HELP shadowgate_backend_requests_total Total requests per backend
+# TYPE shadowgate_backend_requests_total counter
+shadowgate_backend_requests_total{backend="backend1"} 75000
+shadowgate_backend_requests_total{backend="backend2"} 50000
+
+# HELP shadowgate_backend_errors_total Total errors per backend
+# TYPE shadowgate_backend_errors_total counter
+shadowgate_backend_errors_total{backend="backend1"} 150
+shadowgate_backend_errors_total{backend="backend2"} 100
+
+# HELP shadowgate_backend_latency_ms_avg Average latency per backend in milliseconds
+# TYPE shadowgate_backend_latency_ms_avg gauge
+shadowgate_backend_latency_ms_avg{backend="backend1"} 8.500
+shadowgate_backend_latency_ms_avg{backend="backend2"} 12.300
+
+# HELP shadowgate_backend_latency_ms_min Minimum latency per backend in milliseconds
+# TYPE shadowgate_backend_latency_ms_min gauge
+shadowgate_backend_latency_ms_min{backend="backend1"} 1.200
+shadowgate_backend_latency_ms_min{backend="backend2"} 2.100
+
+# HELP shadowgate_backend_latency_ms_max Maximum latency per backend in milliseconds
+# TYPE shadowgate_backend_latency_ms_max gauge
+shadowgate_backend_latency_ms_max{backend="backend1"} 245.800
+shadowgate_backend_latency_ms_max{backend="backend2"} 189.400
+
+# HELP shadowgate_backend_error_rate Error rate per backend (percentage)
+# TYPE shadowgate_backend_error_rate gauge
+shadowgate_backend_error_rate{backend="backend1"} 0.20
+shadowgate_backend_error_rate{backend="backend2"} 0.20
+
+# HELP shadowgate_circuit_breaker_state Circuit breaker state (0=closed, 1=open, 2=half-open)
+# TYPE shadowgate_circuit_breaker_state gauge
+shadowgate_circuit_breaker_state{profile="c2-front",backend="backend1"} 0
+shadowgate_circuit_breaker_state{profile="c2-front",backend="backend2"} 0
+
+# HELP shadowgate_circuit_breaker_failures Current consecutive failure count
+# TYPE shadowgate_circuit_breaker_failures gauge
+shadowgate_circuit_breaker_failures{profile="c2-front",backend="backend1"} 0
+shadowgate_circuit_breaker_failures{profile="c2-front",backend="backend2"} 2
+
+# HELP shadowgate_circuit_breaker_successes Current consecutive success count in half-open state
+# TYPE shadowgate_circuit_breaker_successes gauge
+shadowgate_circuit_breaker_successes{profile="c2-front",backend="backend1"} 0
+shadowgate_circuit_breaker_successes{profile="c2-front",backend="backend2"} 0
+
+# HELP shadowgate_backend_healthy Backend health status (1=healthy, 0=unhealthy)
+# TYPE shadowgate_backend_healthy gauge
+shadowgate_backend_healthy{profile="c2-front",backend="backend1"} 1
+shadowgate_backend_healthy{profile="c2-front",backend="backend2"} 1
 ```
 
 **Prometheus Configuration**
@@ -197,19 +329,26 @@ scrape_configs:
     static_configs:
       - targets: ['127.0.0.1:9090']
     metrics_path: '/metrics/prometheus'
+    # If authentication is configured:
+    # authorization:
+    #   type: Bearer
+    #   credentials: your-secret-token
 ```
 
 **Example**
 
 ```bash
 curl http://127.0.0.1:9090/metrics/prometheus
+
+# With authentication
+curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:9090/metrics/prometheus
 ```
 
 ---
 
 ### GET /backends
 
-Backend pool status and health information.
+Backend pool status, health information, and circuit breaker state.
 
 **Response**
 
@@ -228,7 +367,13 @@ Backend pool status and health information.
           "last_check": "2024-01-15T10:30:00Z",
           "last_healthy": "2024-01-15T10:30:00Z",
           "check_count": 1500,
-          "fail_count": 0
+          "fail_count": 0,
+          "circuit_breaker": {
+            "state": "closed",
+            "failures": 0,
+            "successes": 0,
+            "last_state_change": "2024-01-15T08:00:00Z"
+          }
         },
         {
           "name": "c2-secondary",
@@ -238,7 +383,13 @@ Backend pool status and health information.
           "last_check": "2024-01-15T10:30:00Z",
           "last_healthy": "2024-01-15T10:30:00Z",
           "check_count": 1500,
-          "fail_count": 2
+          "fail_count": 2,
+          "circuit_breaker": {
+            "state": "closed",
+            "failures": 2,
+            "successes": 0,
+            "last_state_change": "2024-01-15T10:25:00Z"
+          }
         }
       ]
     }
@@ -258,6 +409,24 @@ Backend pool status and health information.
 | `last_healthy` | string | Last successful check time |
 | `check_count` | int64 | Total health checks performed |
 | `fail_count` | int64 | Failed health checks |
+| `circuit_breaker` | object | Circuit breaker state |
+
+**Circuit Breaker Fields**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | string | Current state: `closed`, `open`, or `half-open` |
+| `failures` | int | Consecutive failure count |
+| `successes` | int | Consecutive success count (in half-open state) |
+| `last_state_change` | string | Last state transition time (RFC3339) |
+
+**Circuit Breaker States**
+
+| State | Description |
+|-------|-------------|
+| `closed` | Normal operation, requests flow to backend |
+| `open` | Backend failing, requests are rejected (503) |
+| `half-open` | Testing recovery, limited requests allowed |
 
 **Example**
 

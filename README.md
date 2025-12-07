@@ -38,16 +38,22 @@ A high-performance stealth redirector and deception gateway written in Go. Shado
 ### Deception & Proxying
 - **Reverse Proxy** - HTTP/HTTPS proxying to backend servers
 - **Load Balancing** - Round-robin and weighted backend selection with health awareness
-- **Health Checks** - Automatic backend health monitoring and failover
+- **Health Checks** - Automatic backend health monitoring with per-backend custom endpoints
+- **Circuit Breaker** - Automatic backend failover with configurable thresholds
+- **Request Retry** - Automatic retry on backend failure with failover to healthy backends
 - **Static Decoys** - Serve configurable fake responses to blocked traffic
 - **Redirects** - Send 3xx redirects to external sites
 - **Tarpit** - Slow responses to waste attacker resources
 
 ### Operations
-- **Structured Logging** - JSON logging with request metadata
-- **Metrics API** - Real-time statistics via REST endpoint
-- **Admin API** - Health, status, backends, and config validation endpoints
+- **Structured Logging** - JSON logging with request metadata and request ID tracing
+- **Request Tracing** - X-Request-ID header propagation for distributed tracing
+- **Metrics API** - Real-time statistics via REST endpoint (JSON and Prometheus formats)
+- **Backend Metrics** - Per-backend latency, error rates, and request counts
+- **Admin API** - Health, status, backends, metrics, and config validation endpoints
+- **API Authentication** - Bearer token and IP allowlist for admin API security
 - **Config Validation** - SIGHUP-based configuration validation
+- **Graceful Shutdown** - Connection draining with configurable timeout
 - **TLS Termination** - HTTPS listeners with configurable certificates
 
 ## Quick Start
@@ -105,6 +111,10 @@ global:
     format: json
     output: stdout
   metrics_addr: "127.0.0.1:9090"
+  admin_api:
+    token: "your-secret-token"        # Optional: Bearer token for API auth
+    allowed_ips: ["127.0.0.1"]        # Optional: IP allowlist for API
+  shutdown_timeout: 30                 # Graceful shutdown timeout (seconds)
 
 profiles:
   - id: default
@@ -116,6 +126,8 @@ profiles:
       - name: backend1
         url: http://127.0.0.1:9000
         weight: 10
+        timeout: 30s                   # Per-backend timeout
+        health_check_path: /health     # Custom health endpoint
 
     rules:
       allow:
@@ -153,13 +165,18 @@ See [docs/CONFIG.md](docs/CONFIG.md) for complete configuration reference.
 
 The Admin API provides endpoints for monitoring and management:
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check (returns `{"status": "ok"}`) |
-| `/status` | GET | System status with version, uptime, memory |
-| `/metrics` | GET | Request statistics and counters |
-| `/backends` | GET | Backend health status |
-| `/reload` | POST | Trigger configuration reload |
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/health` | GET | No | Health check (returns `{"status": "ok"}`) |
+| `/status` | GET | Yes | System status with version, uptime, memory |
+| `/metrics` | GET | Yes | Request statistics and counters (JSON) |
+| `/metrics/prometheus` | GET | Yes | Prometheus-format metrics |
+| `/backends` | GET | Yes | Backend health and circuit breaker status |
+| `/reload` | POST | Yes | Trigger configuration validation |
+
+**Authentication**: When configured, endpoints (except `/health`) require:
+- Bearer token via `Authorization: Bearer <token>` header
+- Request from allowed IP (if IP allowlist configured)
 
 See [docs/API.md](docs/API.md) for complete API reference.
 
@@ -259,10 +276,14 @@ go test -fuzz=FuzzIPRule -fuzztime=2s ./internal/rules/
 ## Security Considerations
 
 - Run as non-root user in production
+- Configure Admin API authentication (bearer token and/or IP allowlist)
 - Restrict Admin API to localhost or trusted networks
+- Configure `trusted_proxies` when behind load balancers to prevent IP spoofing
 - Use TLS for all external-facing listeners
+- Set appropriate `max_request_body` to prevent DoS attacks
 - Regularly update GeoIP database
 - Review logs for suspicious activity
+- Use request ID tracing (X-Request-ID) for incident investigation
 
 ## License
 

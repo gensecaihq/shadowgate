@@ -7,8 +7,11 @@ Operational procedures for deploying, managing, and troubleshooting ShadowGate.
 1. [Deployment](#deployment)
 2. [Configuration Management](#configuration-management)
 3. [Monitoring](#monitoring)
-4. [Troubleshooting](#troubleshooting)
-5. [Maintenance](#maintenance)
+4. [Graceful Shutdown](#graceful-shutdown)
+5. [Circuit Breaker](#circuit-breaker)
+6. [Request Tracing](#request-tracing)
+7. [Troubleshooting](#troubleshooting)
+8. [Maintenance](#maintenance)
 
 ---
 
@@ -82,12 +85,34 @@ sudo systemctl status shadowgate
 # Verify listening ports
 ss -tlnp | grep shadowgate
 
-# Test health endpoint
+# Test health endpoint (no auth required)
 curl http://127.0.0.1:9090/health
+
+# Test authenticated endpoint (if auth configured)
+curl -H "Authorization: Bearer your-token" http://127.0.0.1:9090/status
 
 # Check logs
 sudo journalctl -u shadowgate -f
 ```
+
+### Admin API Security
+
+Always configure authentication for production:
+
+```yaml
+global:
+  admin_api:
+    token: "your-secret-token"      # Required for API access
+    allowed_ips:                     # Optional IP allowlist
+      - "127.0.0.1"
+      - "10.0.0.0/8"
+```
+
+**Security Notes**:
+- `/health` endpoint is always accessible (for load balancer checks)
+- All other endpoints require authentication when configured
+- IP allowlist is checked before token validation
+- Use both for defense in depth
 
 ---
 
@@ -163,6 +188,10 @@ sudo systemctl restart shadowgate
 | `denied_requests` | >50% | >80% | High block rate |
 | `goroutines` | >1000 | >5000 | Goroutine leak |
 | `memory.alloc_bytes` | >500MB | >1GB | Memory pressure |
+| `backend_error_rate` | >1% | >5% | Backend errors |
+| `circuit_breaker_state` | =1 | N/A | Circuit open |
+| `backend_healthy` | =0 | N/A | Backend down |
+| `backend_latency_ms_avg` | >200 | >1000 | Backend slow |
 
 ### Health Check Commands
 
@@ -170,11 +199,17 @@ sudo systemctl restart shadowgate
 # Service health
 curl -s http://127.0.0.1:9090/health | jq .
 
-# Backend health
-curl -s http://127.0.0.1:9090/backends | jq '.profiles[].healthy'
+# Backend health and circuit breaker status
+curl -s http://127.0.0.1:9090/backends | jq '.profiles[].backends[] | {name, healthy, circuit_breaker: .circuit_breaker.state}'
 
 # Request metrics
 curl -s http://127.0.0.1:9090/metrics | jq '{rate: .requests_per_sec, latency: .avg_response_ms}'
+
+# Backend latency metrics
+curl -s http://127.0.0.1:9090/metrics | jq '.backend_stats | to_entries[] | {backend: .key, avg_latency: .value.avg_latency_ms, error_rate: .value.error_rate}'
+
+# Circuit breaker status
+curl -s http://127.0.0.1:9090/backends | jq '.profiles[].backends[] | select(.circuit_breaker.state != "closed") | {name, state: .circuit_breaker.state}'
 ```
 
 ### Log Analysis
@@ -224,6 +259,191 @@ UNHEALTHY=$(echo "$BACKENDS" | jq '[.profiles[].backends[] | select(.healthy == 
 if [ "$UNHEALTHY" -gt 0 ]; then
     echo "WARNING: $UNHEALTHY backends unhealthy"
 fi
+```
+
+---
+
+## Graceful Shutdown
+
+ShadowGate supports graceful shutdown with connection draining.
+
+### How It Works
+
+1. When SIGTERM or SIGINT is received, ShadowGate stops accepting new connections
+2. Active connections are allowed to complete within the configured timeout
+3. Health checkers stop marking backends as unhealthy
+4. Admin API is stopped
+5. Once all connections drain (or timeout expires), the process exits
+
+### Configuration
+
+```yaml
+global:
+  shutdown_timeout: 30  # seconds to wait for connections to drain
+```
+
+### Triggering Graceful Shutdown
+
+```bash
+# Systemd (recommended)
+sudo systemctl stop shadowgate
+
+# Direct signal
+kill -SIGTERM $(pidof shadowgate)
+
+# Or
+kill -SIGINT $(pidof shadowgate)
+```
+
+### Monitoring Shutdown
+
+```bash
+# Watch logs during shutdown
+journalctl -u shadowgate -f
+```
+
+Expected log sequence:
+```
+Shutting down - draining connections
+Health checkers stopped
+Admin API stopped
+Draining connections (timeout: 30s)
+All connections drained successfully
+Shutdown complete
+```
+
+### Forced Shutdown
+
+If graceful shutdown takes too long:
+```bash
+kill -SIGKILL $(pidof shadowgate)
+```
+**Warning**: This drops active connections immediately.
+
+---
+
+## Circuit Breaker
+
+The circuit breaker pattern prevents cascading failures when backends are unhealthy.
+
+### States
+
+| State | Description | Behavior |
+|-------|-------------|----------|
+| **Closed** | Normal operation | Requests flow to backend |
+| **Open** | Backend failing | Requests return 503 immediately |
+| **Half-Open** | Testing recovery | Limited requests sent to backend |
+
+### Configuration
+
+Circuit breaker uses sensible defaults:
+- **Failure Threshold**: 5 consecutive failures to open circuit
+- **Success Threshold**: 2 consecutive successes to close circuit
+- **Timeout**: 30 seconds before transitioning from open to half-open
+
+### Monitoring Circuit Breakers
+
+```bash
+# Check circuit breaker state via API
+curl -s http://127.0.0.1:9090/backends | jq '.profiles[].backends[] | {name, circuit_breaker}'
+
+# Via Prometheus metrics
+curl -s http://127.0.0.1:9090/metrics/prometheus | grep circuit_breaker
+```
+
+### Circuit Breaker Metrics
+
+| Metric | Description |
+|--------|-------------|
+| `shadowgate_circuit_breaker_state` | 0=closed, 1=open, 2=half-open |
+| `shadowgate_circuit_breaker_failures` | Consecutive failure count |
+| `shadowgate_circuit_breaker_successes` | Consecutive success count (half-open) |
+| `shadowgate_backend_healthy` | Health check status (1=healthy) |
+
+### Alerting on Circuit Breakers
+
+```bash
+#!/bin/bash
+# Alert when any circuit breaker is open
+OPEN_CIRCUITS=$(curl -s http://127.0.0.1:9090/backends | \
+  jq '[.profiles[].backends[] | select(.circuit_breaker.state == "open")] | length')
+
+if [ "$OPEN_CIRCUITS" -gt 0 ]; then
+    echo "ALERT: $OPEN_CIRCUITS circuit breaker(s) are OPEN"
+    # Send alert via your preferred method
+fi
+```
+
+### Manual Recovery
+
+If a circuit breaker is stuck open after backend recovery:
+
+1. Restart ShadowGate (circuit breakers reset on startup)
+2. Or wait for the automatic half-open transition (30s default)
+
+---
+
+## Request Tracing
+
+ShadowGate supports distributed tracing via the X-Request-ID header.
+
+### How It Works
+
+1. If a request includes `X-Request-ID`, ShadowGate preserves it
+2. If no `X-Request-ID` is present, ShadowGate generates a unique ID
+3. The ID is included in:
+   - Response headers to the client
+   - Request headers to the backend
+   - Access logs
+
+### Log Format
+
+```json
+{
+  "timestamp": "2024-01-15T10:30:00Z",
+  "request_id": "a1b2c3d4e5f6g7h8",
+  "profile_id": "c2-front",
+  "client_ip": "10.0.0.1",
+  "method": "GET",
+  "path": "/api/data",
+  "action": "allow_forward",
+  "duration_ms": 12.5
+}
+```
+
+### Correlating Requests
+
+To trace a request across systems:
+
+```bash
+# Find request in ShadowGate logs
+cat /var/log/shadowgate/access.log | jq 'select(.request_id == "a1b2c3d4e5f6g7h8")'
+
+# Or with journald
+journalctl -u shadowgate | grep "a1b2c3d4e5f6g7h8"
+```
+
+### Client-Side Tracing
+
+Include your own request ID for end-to-end tracing:
+
+```bash
+curl -H "X-Request-ID: my-trace-123" https://your-server/api/endpoint
+```
+
+The same ID will be logged by ShadowGate and forwarded to backends.
+
+### Debugging with Request IDs
+
+When investigating issues:
+
+1. Get the request ID from client response headers
+2. Search ShadowGate logs for that ID
+3. Search backend logs for the same ID
+
+```bash
+# Response header shows request ID
+curl -v https://your-server/api/endpoint 2>&1 | grep X-Request-ID
 ```
 
 ---
